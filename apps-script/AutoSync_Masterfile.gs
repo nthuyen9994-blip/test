@@ -1,16 +1,13 @@
 /**
  * AUTO SYNC cho SC_Masterfile_Onboarding_Training
  * ------------------------------------------------------------
- * 1) syncUpcomingBD : chụp (snapshot) DS BD upcoming từ
+ * 1) syncUpcomingBD : lấy DS BD upcoming từ
  *    [SPX BD]- Headcount Tracker › "[BD] Headcount_upcoming" cột AN:AZ
- *    → nối thêm vào sheet "Danh sách OB (draw)" (A:M). Chỉ THÊM người mới
- *    (so theo Staff ID / Email), không xoá ai → qua ngày HC Tracker mất DS
- *    thì Masterfile vẫn giữ.
- * 1b) updateOnboardStatus: cột S "Trang_Thai_OB" tự chuyển
- *    Chờ onboard → Đã onboard   (đã điểm danh "Có", hoặc HC Tracker báo Active và đã tới ngày OB)
- *               → Không onboard (nằm trong sheet Inactive / Status = Inactive)
- *               → Cần kiểm tra  (quá ngày OB + GRACE_DAYS mà chưa có tín hiệu nào)
- *    Sửa tay thành "Đã onboard"/"Không onboard" thì script không ghi đè nữa.
+ *    → nối thêm vào sheet "Danh sách OB (draw)" (A:M).
+ *    - Chỉ THÊM người chưa từng lấy về (nhớ Staff ID/Email trong sheet ẩn
+ *      "Sync_Seen") → qua ngày HC Tracker mất DS thì Masterfile vẫn giữ.
+ *    - Trainer điểm danh ở Masterfile, hoặc XOÁ dòng người không đến:
+ *      script sẽ KHÔNG thêm lại người đã xoá.
  * 2) syncQuizResults: lấy Data_Topic1 / Data_Topic2 từ file
  *    "Kết quả bài quiz sau training" → nối các lượt làm mới vào sheet cùng tên
  *    trong Masterfile (khoá = Email + Attempt_No).
@@ -38,13 +35,7 @@ const CFG = {
 
   OB_SHEET: 'Danh sách OB (draw)',
   OB_NOTE_COL: 18,             // R = Ghi_chu
-  OB_STATUS_COL: 19,           // S = Trang_Thai_OB (cột mới)
-
-  // Nguồn xác nhận BD đã thực sự onboard
-  HC_ACTIVE_SHEET: 'Headcount List - Update',   // C=Staff ID, D=Mail, P=Status
-  HC_INACTIVE_SHEET: 'Inactive',                // B=Staff ID, C=Mail
-  ATTEND_SHEET: 'Diem_Danh',                    // A=Email, F=Chang1_Buoi1, G=Chang1_Buoi2
-  GRACE_DAYS: 3,               // quá ngày OB bấy nhiêu ngày mà chưa thấy → "Cần kiểm tra"
+  SEEN_SHEET: 'Sync_Seen',     // sheet ẩn: những ai đã từng lấy về
   LOG_SHEET: 'Sync_Log',
   TZ: 'Asia/Ho_Chi_Minh',
 };
@@ -56,7 +47,6 @@ function onOpen() {
     .createMenu('🔄 Auto Sync')
     .addItem('Đồng bộ ngay (DS onboard + Quiz)', 'syncAll')
     .addItem('Chỉ lấy DS BD upcoming', 'syncUpcomingBD')
-    .addItem('Chỉ cập nhật trạng thái onboard', 'updateOnboardStatus')
     .addItem('Chỉ lấy kết quả Quiz', 'syncQuizResults')
     .addSeparator()
     .addItem('Bật chạy tự động mỗi giờ', 'setupTriggers')
@@ -76,7 +66,6 @@ function syncAll() {
   if (!lock.tryLock(30 * 1000)) return;
   try {
     syncUpcomingBD();
-    updateOnboardStatus();
     syncQuizResults();
   } finally {
     lock.releaseLock();
@@ -92,43 +81,48 @@ function syncUpcomingBD() {
 
   // --- Đọc nguồn ---
   const hc = SpreadsheetApp.openById(CFG.HC_ID).getSheetByName(CFG.HC_SHEET);
+  if (!hc) throw new Error('Không thấy sheet ' + CFG.HC_SHEET + ' trong Headcount Tracker');
   const hcLast = hc.getLastRow();
   if (hcLast < 2) return log_('BD upcoming', 0, 'Nguồn trống');
-  const src = hc.getRange(CFG.HC_FIRST_COL + '2:' + colLetter_(colIndex_(CFG.HC_FIRST_COL) + CFG.HC_NUM_COLS - 1) + hcLast)
+  const firstCol = colIndex_(CFG.HC_FIRST_COL);
+  const src = hc.getRange(2, firstCol, hcLast - 1, CFG.HC_NUM_COLS)
     .getValues()
     .filter(r => isValid_(r[0]) && isValid_(r[1]));   // có Full Name + Staff ID
 
-  // --- Đọc đích: khoá theo Staff ID & Email ---
+  // --- Đọc đích ---
   const obLast = lastDataRow_(ob, 2);                  // dò theo cột B (Staff_ID)
   const existing = obLast >= 2 ? ob.getRange(2, 1, obLast - 1, 6).getValues() : [];
-  const ids = new Set(), mails = new Set();
   const rowById = {};
-  existing.forEach((r, i) => {
-    const id = norm_(r[1]), mail = norm_(r[2]);
-    if (id) { ids.add(id); rowById[id] = i + 2; }
-    if (mail) mails.add(mail);
-  });
+  existing.forEach((r, i) => { const id = norm_(r[1]); if (id) rowById[id] = i + 2; });
+
+  // --- Danh sách đã từng lấy về (kể cả người trainer đã xoá) ---
+  const seen = getSeen_();
+  if (seen.size === 0) {                               // lần chạy đầu: nạp DS đang có
+    existing.forEach(r => { if (norm_(r[1])) seen.add(norm_(r[1])); if (norm_(r[2])) seen.add(norm_(r[2])); });
+  }
 
   const today = Utilities.formatDate(new Date(), CFG.TZ, 'dd/MM/yyyy');
-  const toAdd = [];
+  const toAdd = [], newKeys = [];
   let updated = 0;
 
   src.forEach(r => {
     const id = norm_(r[1]), mail = norm_(r[2]);
-    if (ids.has(id) || (mail && mails.has(mail))) {
-      // Đã có → chỉ cập nhật Start_Date nếu HR đổi ngày onboard
-      const row = rowById[id];
-      if (row && r[5] instanceof Date) {
+
+    // Đang có trong Masterfile → chỉ cập nhật Start_Date nếu HR đổi ngày OB
+    const row = rowById[id];
+    if (row) {
+      if (r[5] instanceof Date) {
         const cell = ob.getRange(row, 6);
         const cur = cell.getValue();
-        if (!(cur instanceof Date) || cur.getTime() !== r[5].getTime()) {
-          cell.setValue(r[5]);
-          updated++;
-        }
+        if (!(cur instanceof Date) || cur.getTime() !== r[5].getTime()) { cell.setValue(r[5]); updated++; }
       }
       return;
     }
-    ids.add(id); if (mail) mails.add(mail);
+    // Đã từng lấy về rồi (trainer đã xoá vì không đến) → bỏ qua
+    if (seen.has(id) || (mail && seen.has(mail))) return;
+
+    seen.add(id); if (mail) seen.add(mail);
+    newKeys.push([id, mail, today]);
     toAdd.push(r);
   });
 
@@ -137,91 +131,34 @@ function syncUpcomingBD() {
     ob.getRange(start, 1, toAdd.length, CFG.HC_NUM_COLS).setValues(toAdd);
     ob.getRange(start, CFG.OB_NOTE_COL, toAdd.length, 1)
       .setValues(toAdd.map(() => ['Auto từ HC Tracker ' + today]));
-    ob.getRange(start, CFG.OB_STATUS_COL, toAdd.length, 1)
-      .setValues(toAdd.map(() => [ST.WAIT]));
   }
+  saveSeen_(seen, newKeys);
   log_('BD upcoming', toAdd.length, 'Thêm mới ' + toAdd.length + ', đổi ngày OB ' + updated);
 }
 
-/* ====================== 1b. XÁC NHẬN ĐÃ ONBOARD ====================== */
-
-const ST = {
-  WAIT: 'Chờ onboard',
-  DONE: 'Đã onboard',
-  NO: 'Không onboard',
-  CHECK: 'Cần kiểm tra',
-};
-// Chỉ các trạng thái này mới được script tự đổi. Bạn sửa tay thành
-// "Đã onboard" / "Không onboard" thì script sẽ KHÔNG đụng vào nữa.
-const AUTO_ST = new Set([ST.WAIT, ST.CHECK]);
-
-function updateOnboardStatus() {
-  const master = SpreadsheetApp.getActive();
-  const ob = master.getSheetByName(CFG.OB_SHEET);
-  ensureStatusColumn_(ob);
-
-  const obLast = lastDataRow_(ob, 2);
-  if (obLast < 2) return;
-  const rows = ob.getRange(2, 1, obLast - 1, CFG.OB_STATUS_COL).getValues();
-
-  // --- Tín hiệu từ HC Tracker ---
-  const hc = SpreadsheetApp.openById(CFG.HC_ID);
-  const active = new Set(), inactive = new Set();
-  const act = hc.getSheetByName(CFG.HC_ACTIVE_SHEET);
-  if (act && act.getLastRow() > 1) {
-    act.getRange(2, 3, act.getLastRow() - 1, 14).getValues()      // C..P
-      .forEach(r => {
-        const st = norm_(r[13]);                                    // P = Status
-        const set = st === 'active' ? active : st === 'inactive' ? inactive : null;
-        if (set) { if (norm_(r[0])) set.add(norm_(r[0])); if (norm_(r[1])) set.add(norm_(r[1])); }
-      });
+function getSeen_() {
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.SEEN_SHEET);
+  const set = new Set();
+  if (sh && sh.getLastRow() > 1) {
+    sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues()
+      .forEach(r => { if (norm_(r[0])) set.add(norm_(r[0])); if (norm_(r[1])) set.add(norm_(r[1])); });
   }
-  const ina = hc.getSheetByName(CFG.HC_INACTIVE_SHEET);
-  if (ina && ina.getLastRow() > 1) {
-    ina.getRange(2, 2, ina.getLastRow() - 1, 2).getValues()       // B..C
-      .forEach(r => { if (norm_(r[0])) inactive.add(norm_(r[0])); if (norm_(r[1])) inactive.add(norm_(r[1])); });
-  }
-
-  // --- Tín hiệu từ điểm danh trong Masterfile ---
-  const attended = new Set();
-  const dd = master.getSheetByName(CFG.ATTEND_SHEET);
-  if (dd && dd.getLastRow() > 1) {
-    dd.getRange(2, 1, dd.getLastRow() - 1, 7).getValues()
-      .forEach(r => { if (norm_(r[5]) === 'có' || norm_(r[6]) === 'có') attended.add(norm_(r[0])); });
-  }
-
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const DAY = 24 * 3600 * 1000;
-  const changes = { [ST.DONE]: 0, [ST.NO]: 0, [ST.CHECK]: 0 };
-
-  const out = rows.map(r => {
-    const cur = String(r[CFG.OB_STATUS_COL - 1]).trim();
-    if (!AUTO_ST.has(cur)) return [cur];                 // trống hoặc đã chốt tay → giữ nguyên
-    const id = norm_(r[1]), mail = norm_(r[2]);
-    const start = r[5] instanceof Date ? r[5] : null;
-    const has = set => (id && set.has(id)) || (mail && set.has(mail));
-
-    let next = ST.WAIT;
-    if (attended.has(mail) || (has(active) && start && start <= today)) next = ST.DONE;
-    else if (has(inactive)) next = ST.NO;
-    else if (start && today - start > CFG.GRACE_DAYS * DAY) next = ST.CHECK;
-
-    if (next !== cur && changes[next] !== undefined) changes[next]++;
-    return [next];
-  });
-
-  ob.getRange(2, CFG.OB_STATUS_COL, out.length, 1).setValues(out);
-  log_('Trạng thái OB', changes[ST.DONE] + changes[ST.NO] + changes[ST.CHECK],
-    'Đã onboard +' + changes[ST.DONE] + ', Không onboard +' + changes[ST.NO] + ', Cần kiểm tra +' + changes[ST.CHECK]);
+  return set;
 }
 
-function ensureStatusColumn_(ob) {
-  const head = ob.getRange(1, CFG.OB_STATUS_COL);
-  if (!String(head.getValue()).trim()) head.setValue('Trang_Thai_OB');
-  const rule = SpreadsheetApp.newDataValidation()
-    .requireValueInList([ST.WAIT, ST.DONE, ST.NO, ST.CHECK], true)
-    .setAllowInvalid(true).build();
-  ob.getRange(2, CFG.OB_STATUS_COL, Math.max(ob.getMaxRows() - 1, 1), 1).setDataValidation(rule);
+function saveSeen_(seen, newKeys) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(CFG.SEEN_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(CFG.SEEN_SHEET);
+    sh.appendRow(['Staff_ID', 'Email', 'Ngay_lay_ve']);
+    // lần đầu: ghi luôn DS đang có trong Masterfile
+    const initial = [...seen].filter(k => !newKeys.some(n => n[0] === k || n[1] === k))
+      .map(k => k.indexOf('@') > -1 ? ['', k, 'có sẵn'] : [k, '', 'có sẵn']);
+    if (initial.length) sh.getRange(2, 1, initial.length, 3).setValues(initial);
+    sh.hideSheet();
+  }
+  if (newKeys.length) sh.getRange(sh.getLastRow() + 1, 1, newKeys.length, 3).setValues(newKeys);
 }
 
 /* ====================== 2. KẾT QUẢ QUIZ ====================== */
@@ -279,12 +216,6 @@ function lastDataRow_(sheet, col) {
 
 function colIndex_(letters) {
   return letters.toUpperCase().split('').reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0);
-}
-
-function colLetter_(n) {
-  let s = '';
-  while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); }
-  return s;
 }
 
 function log_(what, count, msg) {
