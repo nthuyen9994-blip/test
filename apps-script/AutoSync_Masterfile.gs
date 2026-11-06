@@ -86,13 +86,16 @@ function syncAll() {
 
 function syncUpcomingBD() {
   const ob = sheet_(CFG.OB_SHEET);
-  const hc = SpreadsheetApp.openById(CFG.HC_ID).getSheetByName(CFG.HC_SHEET);
+  const hcFile = SpreadsheetApp.openById(CFG.HC_ID);
+  const hc = hcFile.getSheetByName(CFG.HC_SHEET);
   if (!hc) throw new Error('Không thấy sheet ' + CFG.HC_SHEET + ' trong Headcount Tracker');
   const hcLast = hc.getLastRow();
   if (hcLast < 2) return log_('BD upcoming', 0, 'Nguồn trống');
+  const fromTz = hcFile.getSpreadsheetTimeZone(), toTz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
   const src = hc.getRange(2, colIndex_(CFG.HC_FIRST_COL), hcLast - 1, CFG.HC_NUM_COLS)
     .getValues()
-    .filter(r => isValid_(r[0]) && isValid_(r[1]));   // có Full Name + Staff ID
+    .filter(r => isValid_(r[0]) && isValid_(r[1]))    // có Full Name + Staff ID
+    .map(r => r.map(v => sameDay_(v, fromTz, toTz))); // giữ đúng ngày dù 2 file khác múi giờ
 
   const obLast = lastDataRow_(ob, 2);
   const existing = obLast >= 2 ? ob.getRange(2, 1, obLast - 1, 6).getValues() : [];
@@ -255,6 +258,7 @@ function syncQuizResults() {
 
 function syncTopic_(quiz, T, isT2) {
   const d = sheet_(T.dest);
+  const fromTz = quiz.getSpreadsheetTimeZone(), toTz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
 
   // Gom tất cả lượt làm từ các sheet Form
   const raw = [];
@@ -264,7 +268,7 @@ function syncTopic_(quiz, T, isT2) {
     s.getRange(2, 1, s.getLastRow() - 1, s.getLastColumn()).getValues().forEach(v => {
       const email = String(v[S.email] || '').trim();
       if (!email || !(v[S.ts] instanceof Date)) return;
-      raw.push({ S, v, email, key: email.toLowerCase(), ts: v[S.ts] });
+      raw.push({ S, v, email, key: email.toLowerCase(), ts: sameClock_(v[S.ts], fromTz, toTz) });
     });
   });
   raw.sort((a, b) => a.ts - b.ts);
@@ -337,6 +341,19 @@ function indexByEmail_(sh) {
   if (last >= 2) sh.getRange(2, 1, last - 1, 1).getValues()
     .forEach((r, i) => { const k = norm_(r[0]); if (k && !idx[k]) idx[k] = i + 2; });
   return idx;
+}
+
+// Ngày (không giờ): 18/11 ở file nguồn → 18/11 ở Masterfile, bất kể múi giờ mỗi file
+function sameDay_(v, fromTz, toTz) {
+  if (!(v instanceof Date) || fromTz === toTz) return v;
+  return Utilities.parseDate(Utilities.formatDate(v, fromTz, 'yyyy-MM-dd'), toTz, 'yyyy-MM-dd');
+}
+
+// Ngày + giờ: 11:54 ở file nguồn → hiển thị 11:54 ở Masterfile
+function sameClock_(v, fromTz, toTz) {
+  if (!(v instanceof Date) || fromTz === toTz) return v;
+  const f = 'yyyy-MM-dd HH:mm:ss';
+  return Utilities.parseDate(Utilities.formatDate(v, fromTz, f), toTz, f);
 }
 
 function isValid_(v) {
